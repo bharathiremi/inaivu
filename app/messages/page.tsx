@@ -35,13 +35,22 @@ type Message = {
 
 export default function MessagesPage() {
   const router = useRouter();
-  const supabase = createClient();
+
+  /*
+   * IMPORTANT:
+   * Keep one Supabase client for this page.
+   * Creating a new client on every render causes realtime
+   * subscriptions and effects to restart unnecessarily.
+   */
+  const [supabase] = useState(() => createClient());
 
   const [userId, setUserId] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
 
   const [people, setPeople] = useState<Profile[]>([]);
-  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversations, setConversations] = useState<
+    Conversation[]
+  >([]);
 
   const [selectedUser, setSelectedUser] =
     useState<Profile | null>(null);
@@ -57,13 +66,35 @@ export default function MessagesPage() {
   const [loading, setLoading] = useState(true);
   const [loadingPeople, setLoadingPeople] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
-  const [openingUser, setOpeningUser] = useState<string | null>(null);
+  const [openingUser, setOpeningUser] = useState<string | null>(
+    null
+  );
   const [sending, setSending] = useState(false);
 
   const [error, setError] = useState("");
   const [mobileChat, setMobileChat] = useState(false);
 
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const [isOtherOnline, setIsOtherOnline] = useState(false);
+  const [isOtherTyping, setIsOtherTyping] = useState(false);
+
+  const messagesEndRef =
+    useRef<HTMLDivElement | null>(null);
+
+  const realtimeRef =
+    useRef<ReturnType<typeof supabase.channel> | null>(null);
+
+  const presenceRef =
+    useRef<ReturnType<typeof supabase.channel> | null>(null);
+
+  const typingTimeoutRef =
+    useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const typingStateRef = useRef(false);
+
+  /*
+   * Prevent duplicate URL opening.
+   */
+  const openedUrlRef = useRef<string | null>(null);
 
   /*
    * =========================================================
@@ -89,11 +120,21 @@ export default function MessagesPage() {
 
       setUserId(user.id);
 
-      const { data } = await supabase
-        .from("profiles")
-        .select("id, full_name, username, avatar_url")
-        .eq("id", user.id)
-        .maybeSingle();
+      const { data, error: profileError } =
+        await supabase
+          .from("profiles")
+          .select(
+            "id, full_name, username, avatar_url"
+          )
+          .eq("id", user.id)
+          .maybeSingle();
+
+      if (profileError) {
+        console.error(
+          "Profile loading error:",
+          profileError
+        );
+      }
 
       if (alive && data) {
         setProfile(data);
@@ -109,7 +150,7 @@ export default function MessagesPage() {
 
   /*
    * =========================================================
-   * LOAD PEOPLE
+   * PEOPLE
    * =========================================================
    */
 
@@ -118,16 +159,23 @@ export default function MessagesPage() {
 
     setLoadingPeople(true);
 
-    const { data, error: peopleError } = await supabase
-      .from("profiles")
-      .select("id, full_name, username, avatar_url")
-      .neq("id", userId)
-      .order("full_name", {
-        ascending: true,
-      });
+    const { data, error: peopleError } =
+      await supabase
+        .from("profiles")
+        .select(
+          "id, full_name, username, avatar_url"
+        )
+        .neq("id", userId)
+        .order("full_name", {
+          ascending: true,
+        });
 
     if (peopleError) {
-      console.error(peopleError);
+      console.error(
+        "People loading error:",
+        peopleError
+      );
+
       setError("Unable to load people.");
     } else {
       setPeople(data ?? []);
@@ -144,225 +192,319 @@ export default function MessagesPage() {
 
   /*
    * =========================================================
-   * LOAD CONVERSATIONS
+   * CONVERSATIONS
    * =========================================================
    */
 
-  const loadConversations = useCallback(async () => {
-    if (!userId) return;
+  const loadConversations = useCallback(
+    async () => {
+      if (!userId) return;
 
-    setLoading(true);
-
-    try {
-      const {
-        data: memberships,
-        error: membershipError,
-      } = await supabase
-        .from("conversation_members")
-        .select("conversation_id")
-        .eq("user_id", userId);
-
-      if (membershipError) {
-        throw membershipError;
-      }
-
-      if (!memberships || memberships.length === 0) {
-        setConversations([]);
-        return;
-      }
-
-      const ids = memberships.map(
-        (item) => item.conversation_id
-      );
-
-      const {
-        data: conversationRows,
-        error: conversationError,
-      } = await supabase
-        .from("conversations")
-        .select("id, created_at")
-        .in("id", ids)
-        .order("created_at", {
-          ascending: false,
-        });
-
-      if (conversationError) {
-        throw conversationError;
-      }
-
-      const result: Conversation[] = [];
-
-      for (const conversation of conversationRows ?? []) {
-        const { data: members } = await supabase
+      try {
+        const {
+          data: memberships,
+          error: membershipError,
+        } = await supabase
           .from("conversation_members")
-          .select("user_id")
-          .eq(
-            "conversation_id",
-            conversation.id
-          );
+          .select("conversation_id")
+          .eq("user_id", userId);
 
-        const otherMember = members?.find(
-          (member) => member.user_id !== userId
+        if (membershipError) {
+          throw membershipError;
+        }
+
+        if (!memberships?.length) {
+          setConversations([]);
+          setLoading(false);
+          return;
+        }
+
+        const ids = memberships.map(
+          (item) => item.conversation_id
         );
 
-        if (!otherMember) continue;
-
-        const { data: otherUser } = await supabase
-          .from("profiles")
-          .select(
-            "id, full_name, username, avatar_url"
-          )
-          .eq("id", otherMember.user_id)
-          .maybeSingle();
-
-        if (!otherUser) continue;
-
-        const { data: latest } = await supabase
-          .from("messages")
-          .select(
-            "content, created_at"
-          )
-          .eq(
-            "conversation_id",
-            conversation.id
-          )
+        const {
+          data: conversationRows,
+          error: conversationError,
+        } = await supabase
+          .from("conversations")
+          .select("id, created_at")
+          .in("id", ids)
           .order("created_at", {
             ascending: false,
-          })
-          .limit(1);
+          });
 
-        const { count } = await supabase
-          .from("messages")
-          .select("id", {
-            count: "exact",
-            head: true,
-          })
-          .eq(
-            "conversation_id",
-            conversation.id
-          )
-          .eq("is_seen", false)
-          .neq("sender_id", userId);
+        if (conversationError) {
+          throw conversationError;
+        }
 
-        result.push({
-          id: conversation.id,
-          otherUser,
-          lastMessage:
-            latest?.[0]?.content ??
-            "Start a conversation",
-          lastMessageAt:
-            latest?.[0]?.created_at ??
-            conversation.created_at,
-          unreadCount: count ?? 0,
-        });
+        const result: Conversation[] = [];
+
+        /*
+         * Load conversations.
+         * This keeps the existing database structure.
+         */
+        for (const conversation of
+          conversationRows ?? []) {
+          const {
+            data: members,
+            error: membersError,
+          } = await supabase
+            .from("conversation_members")
+            .select("user_id")
+            .eq(
+              "conversation_id",
+              conversation.id
+            );
+
+          if (membersError) {
+            console.error(
+              "Conversation members error:",
+              membersError
+            );
+            continue;
+          }
+
+          const otherMember =
+            members?.find(
+              (member) =>
+                member.user_id !== userId
+            );
+
+          if (!otherMember) continue;
+
+          const {
+            data: otherUser,
+            error: otherUserError,
+          } = await supabase
+            .from("profiles")
+            .select(
+              "id, full_name, username, avatar_url"
+            )
+            .eq(
+              "id",
+              otherMember.user_id
+            )
+            .maybeSingle();
+
+          if (
+            otherUserError ||
+            !otherUser
+          ) {
+            continue;
+          }
+
+          const {
+            data: latest,
+            error: latestError,
+          } = await supabase
+            .from("messages")
+            .select(
+              "content, created_at"
+            )
+            .eq(
+              "conversation_id",
+              conversation.id
+            )
+            .order("created_at", {
+              ascending: false,
+            })
+            .limit(1);
+
+          if (latestError) {
+            console.error(
+              "Latest message error:",
+              latestError
+            );
+          }
+
+          const {
+            count,
+            error: unreadError,
+          } = await supabase
+            .from("messages")
+            .select("id", {
+              count: "exact",
+              head: true,
+            })
+            .eq(
+              "conversation_id",
+              conversation.id
+            )
+            .eq("is_seen", false)
+            .neq("sender_id", userId);
+
+          if (unreadError) {
+            console.error(
+              "Unread count error:",
+              unreadError
+            );
+          }
+
+          result.push({
+            id: conversation.id,
+            otherUser,
+            lastMessage:
+              latest?.[0]?.content ??
+              "Start a conversation",
+            lastMessageAt:
+              latest?.[0]?.created_at ??
+              conversation.created_at,
+            unreadCount: count ?? 0,
+          });
+        }
+
+        setConversations(result);
+      } catch (err) {
+        console.error(
+          "Conversation loading error:",
+          err
+        );
+
+        setError(
+          "Unable to load conversations."
+        );
+      } finally {
+        setLoading(false);
       }
-
-      setConversations(result);
-    } catch (err) {
-      console.error(
-        "Conversation loading error:",
-        err
-      );
-
-      setError(
-        "Unable to load conversations."
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [supabase, userId]);
+    },
+    [supabase, userId]
+  );
 
   useEffect(() => {
     if (!userId) return;
 
     loadConversations();
-  }, [userId, loadConversations]);
+  }, [
+    userId,
+    loadConversations,
+  ]);
 
   /*
    * =========================================================
-   * OPEN USER FROM URL
-   *
-   * /messages?userId=xxxx
+   * LOAD MESSAGES
    * =========================================================
    */
 
-  useEffect(() => {
-    if (!userId || !people.length) return;
+  const markMessagesSeen = useCallback(
+    async (conversationId: string) => {
+      if (!userId) return;
 
-    const params = new URLSearchParams(
-      window.location.search
-    );
+      try {
+        const { error: seenError } =
+          await supabase.rpc(
+            "mark_conversation_messages_seen",
+            {
+              p_conversation_id:
+                conversationId,
+            }
+          );
 
-    const targetId = params.get("userId");
+        if (seenError) {
+          console.error(
+            "Seen RPC error:",
+            seenError
+          );
+          return;
+        }
 
-    if (!targetId) return;
+        setMessages((current) =>
+          current.map((message) =>
+            message.sender_id !== userId
+              ? {
+                  ...message,
+                  is_seen: true,
+                }
+              : message
+          )
+        );
 
-    const target = people.find(
-      (person) => person.id === targetId
-    );
+        /*
+         * Update conversation unread count locally.
+         */
+        setConversations((current) =>
+          current.map((conversation) =>
+            conversation.id ===
+            conversationId
+              ? {
+                  ...conversation,
+                  unreadCount: 0,
+                }
+              : conversation
+          )
+        );
+      } catch (err) {
+        console.error(
+          "Mark seen error:",
+          err
+        );
+      }
+    },
+    [supabase, userId]
+  );
 
-    if (target) {
-      openPerson(target);
-    }
-  }, [userId, people]);
+  const loadMessages = useCallback(
+    async (conversationId: string) => {
+      setLoadingMessages(true);
+      setError("");
+
+      const {
+        data,
+        error: messageError,
+      } = await supabase
+        .from("messages")
+        .select(
+          "id, conversation_id, sender_id, content, is_seen, created_at"
+        )
+        .eq(
+          "conversation_id",
+          conversationId
+        )
+        .order("created_at", {
+          ascending: true,
+        });
+
+      if (messageError) {
+        console.error(
+          "Message loading error:",
+          messageError
+        );
+
+        setError(
+          messageError.message ||
+            "Unable to load messages."
+        );
+      } else {
+        setMessages(data ?? []);
+
+        await markMessagesSeen(
+          conversationId
+        );
+      }
+
+      setLoadingMessages(false);
+    },
+    [supabase, markMessagesSeen]
+  );
 
   /*
    * =========================================================
-   * OPEN EXISTING CONVERSATION FROM URL
-   *
-   * /messages?conversationId=xxxx
+   * OPEN USER
    * =========================================================
    */
 
-  useEffect(() => {
-    if (!userId || !conversations.length) return;
-
-    const params = new URLSearchParams(
-      window.location.search
-    );
-
-    const conversationId =
-      params.get("conversationId");
-
-    if (!conversationId) return;
-
-    const conversation =
-      conversations.find(
-        (item) => item.id === conversationId
-      );
-
-    if (!conversation) return;
-
-    setSelectedConversationId(
-      conversation.id
-    );
-
-    setSelectedUser(
-      conversation.otherUser
-    );
-
-    setMobileChat(true);
-  }, [userId, conversations]);
-
-  /*
-   * =========================================================
-   * OPEN PERSON
-   * =========================================================
-   */
-
-  async function openPerson(person: Profile) {
+  async function openPerson(
+    person: Profile
+  ) {
     if (!userId) return;
 
-    if (openingUser === person.id) return;
+    if (openingUser === person.id)
+      return;
 
     setOpeningUser(person.id);
     setError("");
 
     try {
-      /*
-       * First check locally.
-       */
-
       const existing =
         conversations.find(
           (conversation) =>
@@ -391,10 +533,6 @@ export default function MessagesPage() {
         return;
       }
 
-      /*
-       * Create conversation through RPC.
-       */
-
       const {
         data: conversationId,
         error: rpcError,
@@ -406,14 +544,8 @@ export default function MessagesPage() {
       );
 
       if (rpcError) {
-        console.error(
-          "RPC ERROR:",
-          rpcError
-        );
-
         throw new Error(
-          rpcError.message ||
-            "Could not create conversation."
+          rpcError.message
         );
       }
 
@@ -438,17 +570,14 @@ export default function MessagesPage() {
         )}`
       );
 
-      /*
-       * Load messages immediately.
-       * Don't wait for conversations state.
-       */
-
-      await loadMessages(conversationId);
+      await loadMessages(
+        conversationId
+      );
 
       await loadConversations();
     } catch (err) {
       console.error(
-        "OPEN PERSON ERROR:",
+        "Open conversation error:",
         err
       );
 
@@ -464,70 +593,94 @@ export default function MessagesPage() {
 
   /*
    * =========================================================
-   * LOAD MESSAGES
-   * =========================================================
-   */
-
-  const loadMessages = useCallback(
-    async (conversationId: string) => {
-      setLoadingMessages(true);
-      setError("");
-
-      const {
-        data,
-        error: messageError,
-      } = await supabase
-        .from("messages")
-        .select(
-          "id, conversation_id, sender_id, content, is_seen, created_at"
-        )
-        .eq(
-          "conversation_id",
-          conversationId
-        )
-        .order("created_at", {
-          ascending: true,
-        });
-
-      if (messageError) {
-        console.error(
-          "MESSAGE ERROR:",
-          messageError
-        );
-
-        setError(
-          messageError.message ||
-            "Unable to load messages."
-        );
-      } else {
-        setMessages(data ?? []);
-
-        /*
-         * Mark incoming messages as seen.
-         */
-
-        await supabase.rpc(
-          "mark_conversation_messages_seen",
-          {
-            p_conversation_id:
-              conversationId,
-          }
-        );
-      }
-
-      setLoadingMessages(false);
-    },
-    [supabase]
-  );
-
-  /*
-   * =========================================================
-   * WHEN SELECTED CHAT CHANGES
+   * URL OPENING
    * =========================================================
    */
 
   useEffect(() => {
-    if (!selectedConversationId) return;
+    if (!userId || !people.length)
+      return;
+
+    const params = new URLSearchParams(
+      window.location.search
+    );
+
+    const targetId =
+      params.get("userId");
+
+    if (!targetId) return;
+
+    if (
+      openedUrlRef.current ===
+      `user:${targetId}`
+    ) {
+      return;
+    }
+
+    const target = people.find(
+      (person) =>
+        person.id === targetId
+    );
+
+    if (target) {
+      openedUrlRef.current =
+        `user:${targetId}`;
+
+      openPerson(target);
+    }
+  }, [userId, people]);
+
+  useEffect(() => {
+    if (!userId || !conversations.length)
+      return;
+
+    const params = new URLSearchParams(
+      window.location.search
+    );
+
+    const conversationId =
+      params.get("conversationId");
+
+    if (!conversationId) return;
+
+    if (
+      openedUrlRef.current ===
+      `conversation:${conversationId}`
+    ) {
+      return;
+    }
+
+    const conversation =
+      conversations.find(
+        (item) =>
+          item.id === conversationId
+      );
+
+    if (!conversation) return;
+
+    openedUrlRef.current =
+      `conversation:${conversationId}`;
+
+    setSelectedConversationId(
+      conversation.id
+    );
+
+    setSelectedUser(
+      conversation.otherUser
+    );
+
+    setMobileChat(true);
+  }, [userId, conversations]);
+
+  /*
+   * =========================================================
+   * SELECTED CHAT
+   * =========================================================
+   */
+
+  useEffect(() => {
+    if (!selectedConversationId)
+      return;
 
     loadMessages(
       selectedConversationId
@@ -539,16 +692,37 @@ export default function MessagesPage() {
 
   /*
    * =========================================================
-   * REALTIME
+   * AUTO SCROLL
+   * =========================================================
+   */
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+    });
+  }, [
+    messages.length,
+    isOtherTyping,
+  ]);
+
+  /*
+   * =========================================================
+   * REALTIME MESSAGES
    * =========================================================
    */
 
   useEffect(() => {
     if (!userId) return;
 
+    if (realtimeRef.current) {
+      supabase.removeChannel(
+        realtimeRef.current
+      );
+    }
+
     const channel = supabase
       .channel(
-        `inaivu-messages-${userId}`
+        `inaivu-chat-${userId}-${selectedConversationId ?? "none"}`
       )
       .on(
         "postgres_changes",
@@ -561,39 +735,46 @@ export default function MessagesPage() {
           const message =
             payload.new as Message;
 
+          /*
+           * Message belongs to another
+           * conversation.
+           */
           if (
-            message.conversation_id ===
+            message.conversation_id !==
             selectedConversationId
           ) {
-            setMessages((current) => {
-              if (
-                current.some(
-                  (item) =>
-                    item.id ===
-                    message.id
-                )
-              ) {
-                return current;
-              }
+            await loadConversations();
+            return;
+          }
 
-              return [
-                ...current,
-                message,
-              ];
-            });
-
+          setMessages((current) => {
             if (
-              message.sender_id !==
-              userId
+              current.some(
+                (item) =>
+                  item.id ===
+                  message.id
+              )
             ) {
-              await supabase.rpc(
-                "mark_conversation_messages_seen",
-                {
-                  p_conversation_id:
-                    message.conversation_id,
-                }
-              );
+              return current;
             }
+
+            return [
+              ...current,
+              message,
+            ];
+          });
+
+          /*
+           * Incoming message:
+           * immediately mark it as seen
+           * if this chat is open.
+           */
+          if (
+            message.sender_id !== userId
+          ) {
+            await markMessagesSeen(
+              message.conversation_id
+            );
           }
 
           await loadConversations();
@@ -610,6 +791,13 @@ export default function MessagesPage() {
           const updated =
             payload.new as Message;
 
+          if (
+            updated.conversation_id !==
+            selectedConversationId
+          ) {
+            return;
+          }
+
           setMessages((current) =>
             current.map((message) =>
               message.id ===
@@ -622,27 +810,269 @@ export default function MessagesPage() {
       )
       .subscribe();
 
+    realtimeRef.current = channel;
+
     return () => {
-      supabase.removeChannel(channel);
+      supabase.removeChannel(
+        channel
+      );
+
+      realtimeRef.current = null;
     };
   }, [
     userId,
     selectedConversationId,
     supabase,
     loadConversations,
+    markMessagesSeen,
   ]);
 
   /*
    * =========================================================
-   * AUTO SCROLL
+   * REALTIME PRESENCE + TYPING
    * =========================================================
    */
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({
-      behavior: "smooth",
-    });
-  }, [messages]);
+    if (
+      !userId ||
+      !selectedConversationId ||
+      !selectedUser
+    ) {
+      return;
+    }
+
+    if (presenceRef.current) {
+      supabase.removeChannel(
+        presenceRef.current
+      );
+    }
+
+    setIsOtherOnline(false);
+    setIsOtherTyping(false);
+    typingStateRef.current = false;
+
+    const channel = supabase.channel(
+      `presence-conversation-${selectedConversationId}`,
+      {
+        config: {
+          presence: {
+            key: userId,
+          },
+          broadcast: {
+            self: false,
+          },
+        },
+      }
+    );
+
+    channel
+      .on(
+        "presence",
+        {
+          event: "sync",
+        },
+        () => {
+          const state =
+            channel.presenceState();
+
+          const other =
+            state[selectedUser.id];
+
+          setIsOtherOnline(
+            Boolean(other?.length)
+          );
+        }
+      )
+      .on(
+        "presence",
+        {
+          event: "join",
+        },
+        ({ key }) => {
+          if (
+            key === selectedUser.id
+          ) {
+            setIsOtherOnline(true);
+          }
+        }
+      )
+      .on(
+        "presence",
+        {
+          event: "leave",
+        },
+        ({ key }) => {
+          if (
+            key === selectedUser.id
+          ) {
+            setIsOtherOnline(false);
+            setIsOtherTyping(false);
+          }
+        }
+      )
+      .on(
+        "broadcast",
+        {
+          event: "typing",
+        },
+        ({ payload }) => {
+          if (
+            payload?.userId !==
+            selectedUser.id
+          ) {
+            return;
+          }
+
+          setIsOtherTyping(
+            Boolean(payload.typing)
+          );
+        }
+      )
+      .subscribe(
+        async (status) => {
+          if (
+            status ===
+            "SUBSCRIBED"
+          ) {
+            try {
+              await channel.track({
+                userId,
+                online_at:
+                  new Date().toISOString(),
+              });
+            } catch (err) {
+              console.error(
+                "Presence track error:",
+                err
+              );
+            }
+          }
+        }
+      );
+
+    presenceRef.current = channel;
+
+    return () => {
+      supabase.removeChannel(
+        channel
+      );
+
+      presenceRef.current = null;
+
+      setIsOtherOnline(false);
+      setIsOtherTyping(false);
+
+      if (
+        typingTimeoutRef.current
+      ) {
+        clearTimeout(
+          typingTimeoutRef.current
+        );
+      }
+
+      typingStateRef.current =
+        false;
+    };
+  }, [
+    userId,
+    selectedConversationId,
+    selectedUser,
+    supabase,
+  ]);
+
+  /*
+   * =========================================================
+   * TYPING BROADCAST
+   * =========================================================
+   */
+
+  async function broadcastTyping(
+    typing: boolean
+  ) {
+    if (
+      !presenceRef.current ||
+      !userId
+    ) {
+      return;
+    }
+
+    try {
+      await presenceRef.current.send({
+        type: "broadcast",
+        event: "typing",
+        payload: {
+          userId,
+          typing,
+        },
+      });
+    } catch (err) {
+      console.error(
+        "Typing broadcast error:",
+        err
+      );
+    }
+  }
+
+  function handleMessageChange(
+    value: string
+  ) {
+    setMessageText(value);
+
+    const hasText =
+      value.trim().length > 0;
+
+    if (hasText) {
+      if (
+        !typingStateRef.current
+      ) {
+        typingStateRef.current =
+          true;
+
+        void broadcastTyping(true);
+      }
+
+      if (
+        typingTimeoutRef.current
+      ) {
+        clearTimeout(
+          typingTimeoutRef.current
+        );
+      }
+
+      typingTimeoutRef.current =
+        setTimeout(() => {
+          typingStateRef.current =
+            false;
+
+          void broadcastTyping(
+            false
+          );
+        }, 1800);
+    } else {
+      if (
+        typingStateRef.current
+      ) {
+        typingStateRef.current =
+          false;
+
+        void broadcastTyping(
+          false
+        );
+      }
+
+      if (
+        typingTimeoutRef.current
+      ) {
+        clearTimeout(
+          typingTimeoutRef.current
+        );
+
+        typingTimeoutRef.current =
+          null;
+      }
+    }
+  }
 
   /*
    * =========================================================
@@ -666,33 +1096,54 @@ export default function MessagesPage() {
     setSending(true);
     setError("");
 
-    const {
-      data,
-      error: sendError,
-    } = await supabase
-      .from("messages")
-      .insert({
-        conversation_id:
-          selectedConversationId,
-        sender_id: userId,
-        content: text,
-      })
-      .select(
-        "id, conversation_id, sender_id, content, is_seen, created_at"
-      )
-      .single();
-
-    if (sendError) {
-      console.error(
-        "SEND ERROR:",
-        sendError
+    if (
+      typingTimeoutRef.current
+    ) {
+      clearTimeout(
+        typingTimeoutRef.current
       );
 
-      setError(
-        sendError.message ||
-          "Message could not be sent."
-      );
-    } else if (data) {
+      typingTimeoutRef.current =
+        null;
+    }
+
+    typingStateRef.current =
+      false;
+
+    await broadcastTyping(false);
+
+    try {
+      const {
+        data,
+        error: sendError,
+      } = await supabase
+        .from("messages")
+        .insert({
+          conversation_id:
+            selectedConversationId,
+          sender_id: userId,
+          content: text,
+        })
+        .select(
+          "id, conversation_id, sender_id, content, is_seen, created_at"
+        )
+        .single();
+
+      if (sendError) {
+        throw new Error(
+          sendError.message
+        );
+      }
+
+      if (!data) {
+        throw new Error(
+          "Message was not returned."
+        );
+      }
+
+      /*
+       * Optimistic/local message update.
+       */
       setMessages((current) => {
         if (
           current.some(
@@ -711,15 +1162,100 @@ export default function MessagesPage() {
 
       setMessageText("");
 
-      await loadConversations();
-    }
+      /*
+       * =====================================================
+       * MESSAGE NOTIFICATION
+       * =====================================================
+       *
+       * IMPORTANT:
+       * Do NOT add a "message" column here.
+       *
+       * The notification is separate from the
+       * actual message content.
+       */
 
-    setSending(false);
+      if (
+        selectedUser &&
+        selectedUser.id !== userId
+      ) {
+        const {
+          error: notificationError,
+        } = await supabase
+          .from("notifications")
+          .insert({
+            recipient_id:
+              selectedUser.id,
+            actor_id: userId,
+            type: "message",
+            is_read: false,
+          });
+
+        if (notificationError) {
+          /*
+           * Do not make message sending fail
+           * just because notification failed.
+           */
+          console.error(
+            "MESSAGE NOTIFICATION ERROR:",
+            {
+              code:
+                notificationError.code ??
+                null,
+              message:
+                notificationError.message ??
+                null,
+              details:
+                notificationError.details ??
+                null,
+              hint:
+                notificationError.hint ??
+                null,
+            }
+          );
+        }
+      }
+
+      /*
+       * Update current conversation preview
+       * without waiting for another page load.
+       */
+      setConversations((current) =>
+        current.map((conversation) =>
+          conversation.id ===
+          selectedConversationId
+            ? {
+                ...conversation,
+                lastMessage: text,
+                lastMessageAt:
+                  data.created_at,
+              }
+            : conversation
+        )
+      );
+
+      /*
+       * Refresh conversation metadata once.
+       */
+      await loadConversations();
+    } catch (err) {
+      console.error(
+        "SEND MESSAGE ERROR:",
+        err
+      );
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Message could not be sent."
+      );
+    } finally {
+      setSending(false);
+    }
   }
 
   /*
    * =========================================================
-   * ENTER KEY
+   * ENTER
    * =========================================================
    */
 
@@ -731,7 +1267,8 @@ export default function MessagesPage() {
       !e.shiftKey
     ) {
       e.preventDefault();
-      sendMessage();
+
+      void sendMessage();
     }
   }
 
@@ -822,7 +1359,10 @@ export default function MessagesPage() {
       return (
         <img
           src={person.avatar_url}
-          alt={person.full_name}
+          alt={
+            person.full_name ||
+            "Inaivu user"
+          }
           className="avatar-img"
           style={{
             width: size,
@@ -849,7 +1389,50 @@ export default function MessagesPage() {
 
   /*
    * =========================================================
-   * UI
+   * CLOSE CHAT
+   * =========================================================
+   */
+
+  function closeMobileChat() {
+    if (
+      typingStateRef.current
+    ) {
+      typingStateRef.current =
+        false;
+
+      void broadcastTyping(false);
+    }
+
+    if (
+      typingTimeoutRef.current
+    ) {
+      clearTimeout(
+        typingTimeoutRef.current
+      );
+
+      typingTimeoutRef.current =
+        null;
+    }
+
+    setMobileChat(false);
+    setSelectedUser(null);
+    setSelectedConversationId(null);
+    setMessages([]);
+    setIsOtherOnline(false);
+    setIsOtherTyping(false);
+
+    openedUrlRef.current = null;
+
+    window.history.replaceState(
+      null,
+      "",
+      "/messages"
+    );
+  }
+
+  /*
+   * =========================================================
+   * LOADING
    * =========================================================
    */
 
@@ -885,10 +1468,26 @@ export default function MessagesPage() {
               transform: rotate(360deg);
             }
           }
+
+          :global(html.dark) .loading-page {
+            background: #151412;
+            color: #bdb4ac;
+          }
+
+          :global(html.dark) .spinner {
+            border-color: #38322d;
+            border-top-color: #ef704d;
+          }
         `}</style>
       </main>
     );
   }
+
+  /*
+   * =========================================================
+   * UI
+   * =========================================================
+   */
 
   return (
     <main className="page">
@@ -899,10 +1498,6 @@ export default function MessagesPage() {
             : ""
         }`}
       >
-        {/* =================================================
-            SIDEBAR
-        ================================================= */}
-
         <aside
           className={`sidebar ${
             mobileChat
@@ -948,8 +1543,6 @@ export default function MessagesPage() {
             </div>
           )}
 
-          {/* CONVERSATIONS */}
-
           <div className="section">
             <div className="section-title">
               Chats
@@ -973,7 +1566,7 @@ export default function MessagesPage() {
                         ? "active"
                         : ""
                     }`}
-                    onClick={() => {
+                    onClick={async () => {
                       setSelectedConversationId(
                         conversation.id
                       );
@@ -990,6 +1583,13 @@ export default function MessagesPage() {
                         `/messages?conversationId=${encodeURIComponent(
                           conversation.id
                         )}`
+                      );
+
+                      openedUrlRef.current =
+                        `conversation:${conversation.id}`;
+
+                      await loadMessages(
+                        conversation.id
                       );
                     }}
                   >
@@ -1037,8 +1637,6 @@ export default function MessagesPage() {
             )}
           </div>
 
-          {/* PEOPLE */}
-
           <div className="section people-section">
             <div className="section-title">
               People
@@ -1069,7 +1667,19 @@ export default function MessagesPage() {
                       person.id
                     }
                   >
-                    {avatar(person)}
+                    <div className="avatar-wrap">
+                      {avatar(person)}
+
+                      <span
+                        className={`online-dot ${
+                          isOtherOnline &&
+                          selectedUser?.id ===
+                            person.id
+                            ? "online"
+                            : ""
+                        }`}
+                      />
+                    </div>
 
                     <div className="person-info">
                       <strong>
@@ -1096,8 +1706,6 @@ export default function MessagesPage() {
             )}
           </div>
 
-          {/* PROFILE */}
-
           {profile && (
             <button
               className="my-profile"
@@ -1116,7 +1724,8 @@ export default function MessagesPage() {
                 </strong>
 
                 <span>
-                  @{profile.username ||
+                  @
+                  {profile.username ||
                     "username"}
                 </span>
               </div>
@@ -1125,10 +1734,6 @@ export default function MessagesPage() {
             </button>
           )}
         </aside>
-
-        {/* =================================================
-            CHAT
-        ================================================= */}
 
         <section
           className={`chat ${
@@ -1139,38 +1744,30 @@ export default function MessagesPage() {
         >
           {selectedUser ? (
             <>
-              {/* CHAT HEADER */}
-
               <header className="chat-header">
                 <button
                   className="mobile-back"
-                  onClick={() => {
-                    setMobileChat(
-                      false
-                    );
-
-                    setSelectedUser(
-                      null
-                    );
-
-                    setSelectedConversationId(
-                      null
-                    );
-
-                    window.history.replaceState(
-                      null,
-                      "",
-                      "/messages"
-                    );
-                  }}
+                  onClick={
+                    closeMobileChat
+                  }
                 >
                   ←
                 </button>
 
-                {avatar(
-                  selectedUser,
-                  44
-                )}
+                <div className="header-avatar-wrap">
+                  {avatar(
+                    selectedUser,
+                    44
+                  )}
+
+                  <span
+                    className={`header-online-dot ${
+                      isOtherOnline
+                        ? "online"
+                        : ""
+                    }`}
+                  />
+                </div>
 
                 <div className="chat-user">
                   <strong>
@@ -1178,10 +1775,20 @@ export default function MessagesPage() {
                       "Inaivu user"}
                   </strong>
 
-                  <span>
-                    {selectedUser.username
+                  <span
+                    className={
+                      isOtherTyping
+                        ? "typing-status"
+                        : ""
+                    }
+                  >
+                    {isOtherTyping
+                      ? "Typing..."
+                      : isOtherOnline
+                      ? "Online"
+                      : selectedUser.username
                       ? `@${selectedUser.username}`
-                      : "Inaivu"}
+                      : "Offline"}
                   </span>
                 </div>
 
@@ -1196,8 +1803,6 @@ export default function MessagesPage() {
                   View profile
                 </button>
               </header>
-
-              {/* MESSAGES */}
 
               <div className="messages">
                 {loadingMessages ? (
@@ -1261,16 +1866,23 @@ export default function MessagesPage() {
                               </div>
 
                               <div className="message-meta">
-                                {formatTime(
-                                  message.created_at
-                                )}
+                                <span>
+                                  {formatTime(
+                                    message.created_at
+                                  )}
+                                </span>
 
                                 {mine && (
                                   <span
                                     className={
                                       message.is_seen
                                         ? "seen"
-                                        : ""
+                                        : "sent"
+                                    }
+                                    title={
+                                      message.is_seen
+                                        ? "Seen"
+                                        : "Sent"
                                     }
                                   >
                                     {message.is_seen
@@ -1285,6 +1897,16 @@ export default function MessagesPage() {
                       }
                     )}
 
+                    {isOtherTyping && (
+                      <div className="typing-row">
+                        <div className="typing-bubble">
+                          <span />
+                          <span />
+                          <span />
+                        </div>
+                      </div>
+                    )}
+
                     <div
                       ref={
                         messagesEndRef
@@ -1294,8 +1916,6 @@ export default function MessagesPage() {
                 )}
               </div>
 
-              {/* COMPOSER */}
-
               <div className="composer-area">
                 <div className="composer">
                   <textarea
@@ -1303,7 +1923,7 @@ export default function MessagesPage() {
                       messageText
                     }
                     onChange={(e) =>
-                      setMessageText(
+                      handleMessageChange(
                         e.target.value
                       )
                     }
@@ -1320,8 +1940,8 @@ export default function MessagesPage() {
 
                   <button
                     className="send-button"
-                    onClick={
-                      sendMessage
+                    onClick={() =>
+                      void sendMessage()
                     }
                     disabled={
                       !messageText.trim() ||
@@ -1424,6 +2044,14 @@ export default function MessagesPage() {
           color: #ef704d;
           font-size: 20px;
           cursor: pointer;
+          transition:
+            transform 0.15s,
+            background 0.15s;
+        }
+
+        .back-home:hover {
+          transform: translateX(-2px);
+          background: #ffe7dd;
         }
 
         .sidebar-header h1 {
@@ -1465,6 +2093,10 @@ export default function MessagesPage() {
           font-size: 13px;
         }
 
+        .search-box input::placeholder {
+          color: #aaa097;
+        }
+
         .section {
           padding: 0 9px;
         }
@@ -1500,8 +2132,25 @@ export default function MessagesPage() {
           background: #f8f3ed;
         }
 
+        .conversation:active,
+        .person:active {
+          transform: scale(0.99);
+        }
+
         .conversation.active {
           background: #fff0e8;
+        }
+
+        .conversation:disabled,
+        .person:disabled {
+          cursor: wait;
+          opacity: 0.7;
+        }
+
+        .avatar-wrap,
+        .header-avatar-wrap {
+          position: relative;
+          flex: 0 0 auto;
         }
 
         .avatar {
@@ -1520,6 +2169,40 @@ export default function MessagesPage() {
           flex: 0 0 auto;
           object-fit: cover;
           border-radius: 50%;
+        }
+
+        .online-dot {
+          position: absolute;
+          right: 0;
+          bottom: 1px;
+          width: 11px;
+          height: 11px;
+          border: 2px solid #fffdf9;
+          border-radius: 50%;
+          background: #c5beb7;
+          transition:
+            background 0.2s,
+            transform 0.2s;
+        }
+
+        .online-dot.online {
+          background: #36b37e;
+          transform: scale(1.05);
+        }
+
+        .header-online-dot {
+          position: absolute;
+          right: -1px;
+          bottom: 1px;
+          width: 12px;
+          height: 12px;
+          border: 2px solid white;
+          border-radius: 50%;
+          background: #c5beb7;
+        }
+
+        .header-online-dot.online {
+          background: #36b37e;
         }
 
         .conversation-info,
@@ -1585,6 +2268,17 @@ export default function MessagesPage() {
           margin-top: 7px;
         }
 
+        .people-section::-webkit-scrollbar,
+        .messages::-webkit-scrollbar {
+          width: 5px;
+        }
+
+        .people-section::-webkit-scrollbar-thumb,
+        .messages::-webkit-scrollbar-thumb {
+          border-radius: 10px;
+          background: #d8cec3;
+        }
+
         .person-info span {
           display: block;
           margin-top: 2px;
@@ -1608,6 +2302,17 @@ export default function MessagesPage() {
           background: white;
           text-align: left;
           cursor: pointer;
+          transition:
+            background 0.15s,
+            transform 0.15s;
+        }
+
+        .my-profile:hover {
+          background: #faf5ef;
+        }
+
+        .my-profile:active {
+          transform: scale(0.99);
         }
 
         .my-profile > div {
@@ -1660,6 +2365,9 @@ export default function MessagesPage() {
 
         .chat-user strong {
           display: block;
+          overflow: hidden;
+          white-space: nowrap;
+          text-overflow: ellipsis;
           font-size: 14px;
         }
 
@@ -1670,6 +2378,11 @@ export default function MessagesPage() {
           font-size: 10px;
         }
 
+        .chat-user span.typing-status {
+          color: #ef704d;
+          font-weight: 700;
+        }
+
         .profile-button {
           padding: 8px 12px;
           border: 1px solid #e9dfd5;
@@ -1678,6 +2391,14 @@ export default function MessagesPage() {
           color: #726a63;
           font-size: 10px;
           cursor: pointer;
+          transition:
+            background 0.15s,
+            border 0.15s;
+        }
+
+        .profile-button:hover {
+          background: #faf5ef;
+          border-color: #ddcfc3;
         }
 
         .mobile-back {
@@ -1728,6 +2449,19 @@ export default function MessagesPage() {
           font-size: 13px;
           line-height: 1.45;
           word-break: break-word;
+          animation: messageIn 0.16s ease-out;
+        }
+
+        @keyframes messageIn {
+          from {
+            opacity: 0;
+            transform: translateY(3px);
+          }
+
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
         }
 
         .my-bubble {
@@ -1751,8 +2485,58 @@ export default function MessagesPage() {
           opacity: 0.62;
         }
 
+        .sent {
+          letter-spacing: -2px;
+        }
+
         .seen {
           letter-spacing: -2px;
+          font-weight: 800;
+        }
+
+        .typing-row {
+          display: flex;
+          margin: 7px 0;
+        }
+
+        .typing-bubble {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          padding: 11px 13px;
+          border-radius: 15px;
+          border-bottom-left-radius: 5px;
+          background: #f4eee7;
+        }
+
+        .typing-bubble span {
+          width: 5px;
+          height: 5px;
+          border-radius: 50%;
+          background: #9c9289;
+          animation: typing 1.2s infinite;
+        }
+
+        .typing-bubble span:nth-child(2) {
+          animation-delay: 0.15s;
+        }
+
+        .typing-bubble span:nth-child(3) {
+          animation-delay: 0.3s;
+        }
+
+        @keyframes typing {
+          0%,
+          60%,
+          100% {
+            transform: translateY(0);
+            opacity: 0.45;
+          }
+
+          30% {
+            transform: translateY(-3px);
+            opacity: 1;
+          }
         }
 
         .empty-chat,
@@ -1819,6 +2603,16 @@ export default function MessagesPage() {
           border: 1px solid #e6ddd3;
           border-radius: 17px;
           background: #fff;
+          transition:
+            border-color 0.15s,
+            box-shadow 0.15s;
+        }
+
+        .composer:focus-within {
+          border-color: #e7b6a6;
+          box-shadow:
+            0 0 0 3px
+              rgba(239, 112, 77, 0.08);
         }
 
         .composer textarea {
@@ -1849,6 +2643,17 @@ export default function MessagesPage() {
           color: white;
           font-size: 17px;
           cursor: pointer;
+          transition:
+            transform 0.15s,
+            opacity 0.15s;
+        }
+
+        .send-button:hover:not(:disabled) {
+          transform: translateY(-1px);
+        }
+
+        .send-button:active:not(:disabled) {
+          transform: scale(0.96);
         }
 
         .send-button:disabled {
@@ -1967,7 +2772,27 @@ export default function MessagesPage() {
           .composer-area small {
             display: none;
           }
+
+          .chat-header {
+            padding-left: 13px;
+            padding-right: 13px;
+          }
+
+          .messages {
+            padding-left: 10px;
+            padding-right: 10px;
+          }
+
+          .bubble {
+            max-width: 88%;
+          }
         }
+
+        /*
+         * =====================================================
+         * DARK MODE
+         * =====================================================
+         */
 
         :global(html.dark) .page {
           background: #151412;
@@ -1977,11 +2802,28 @@ export default function MessagesPage() {
         :global(html.dark) .shell {
           background: #1d1b19;
           border-color: #302c28;
+          box-shadow:
+            0 18px 60px
+              rgba(0, 0, 0, 0.28);
         }
 
         :global(html.dark) .sidebar {
           background: #1b1917;
           border-color: #302c28;
+        }
+
+        :global(html.dark) .back-home {
+          background: #30221d;
+          color: #ef8a6d;
+        }
+
+        :global(html.dark) .back-home:hover {
+          background: #3b2821;
+        }
+
+        :global(html.dark) .sidebar-header p,
+        :global(html.dark) .section-title {
+          color: #918880;
         }
 
         :global(html.dark) .search-box {
@@ -1993,6 +2835,10 @@ export default function MessagesPage() {
           color: #f5f0eb;
         }
 
+        :global(html.dark) .search-box input::placeholder {
+          color: #817970;
+        }
+
         :global(html.dark) .conversation:hover,
         :global(html.dark) .person:hover {
           background: #292521;
@@ -2000,6 +2846,16 @@ export default function MessagesPage() {
 
         :global(html.dark) .conversation.active {
           background: #35251f;
+        }
+
+        :global(html.dark) .conversation-top span,
+        :global(html.dark) .conversation-bottom p,
+        :global(html.dark) .person-info span {
+          color: #817970;
+        }
+
+        :global(html.dark) .message-arrow {
+          color: #817970;
         }
 
         :global(html.dark) .chat {
@@ -2012,11 +2868,26 @@ export default function MessagesPage() {
           border-color: #302c28;
         }
 
-        :global(html.dark) .messages {
-          background: #181715;
+        :global(html.dark) .chat-user span {
+          color: #8f867e;
         }
 
-        :global(html.dark) .their-bubble {
+        :global(html.dark) .messages {
+          background:
+            radial-gradient(
+              circle at top,
+              #211d1a,
+              #181715 58%
+            );
+        }
+
+        :global(html.dark) .day-label {
+          background: #292521;
+          color: #8e857d;
+        }
+
+        :global(html.dark) .their-bubble,
+        :global(html.dark) .typing-bubble {
           background: #2b2825;
           color: #f3eee8;
         }
@@ -2024,6 +2895,13 @@ export default function MessagesPage() {
         :global(html.dark) .composer {
           background: #24211f;
           border-color: #3a342f;
+        }
+
+        :global(html.dark) .composer:focus-within {
+          border-color: #694235;
+          box-shadow:
+            0 0 0 3px
+              rgba(239, 112, 77, 0.12);
         }
 
         :global(html.dark) .composer textarea {
@@ -2036,15 +2914,58 @@ export default function MessagesPage() {
           background: #30221d;
         }
 
+        :global(html.dark) .empty-chat p,
+        :global(html.dark) .welcome p {
+          color: #8f867e;
+        }
+
         :global(html.dark) .profile-button {
           background: #24211f;
           border-color: #3a342f;
           color: #ddd5cd;
         }
 
+        :global(html.dark) .profile-button:hover {
+          background: #2b2724;
+        }
+
         :global(html.dark) .my-profile {
           background: #24211f;
           border-color: #38322d;
+        }
+
+        :global(html.dark) .my-profile:hover {
+          background: #2b2724;
+        }
+
+        :global(html.dark) .my-profile div span {
+          color: #817970;
+        }
+
+        :global(html.dark) .online-dot {
+          border-color: #1b1917;
+        }
+
+        :global(html.dark) .header-online-dot {
+          border-color: #1b1917;
+        }
+
+        :global(html.dark) .error-box {
+          background: #38231f;
+          color: #ef8f77;
+        }
+
+        :global(html.dark) .empty-small {
+          color: #817970;
+        }
+
+        :global(html.dark) .composer-area small {
+          color: #817970;
+        }
+
+        :global(html.dark) .messages::-webkit-scrollbar-thumb,
+        :global(html.dark) .people-section::-webkit-scrollbar-thumb {
+          background: #413a34;
         }
       `}</style>
     </main>

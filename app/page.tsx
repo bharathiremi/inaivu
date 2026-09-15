@@ -1,11 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createClient } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
-import AdSlot from "@/components/AdSlot";
-
-const supabase = createClient();
 
 type Profile = {
   id: string;
@@ -43,6 +40,17 @@ type Comment = {
   profile: Profile | null;
 };
 
+type LikeRow = {
+  post_id: string;
+  user_id: string;
+};
+
+type CommentCountRow = {
+  post_id: string;
+};
+
+const supabase = createClient();
+
 export default function HomePage() {
   const router = useRouter();
 
@@ -69,6 +77,12 @@ export default function HomePage() {
 
   const [notice, setNotice] = useState("");
 
+  const realtimeTimer = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  const loadingPostsRef = useRef(false);
+
   useEffect(() => {
     start();
 
@@ -82,7 +96,7 @@ export default function HomePage() {
           table: "posts",
         },
         () => {
-          loadPosts();
+          schedulePostsReload();
         },
       )
       .on(
@@ -93,7 +107,7 @@ export default function HomePage() {
           table: "post_likes",
         },
         () => {
-          loadPosts();
+          schedulePostsReload();
         },
       )
       .on(
@@ -104,12 +118,16 @@ export default function HomePage() {
           table: "post_comments",
         },
         () => {
-          loadPosts();
+          schedulePostsReload();
         },
       )
       .subscribe();
 
     return () => {
+      if (realtimeTimer.current) {
+        clearTimeout(realtimeTimer.current);
+      }
+
       supabase.removeChannel(channel);
     };
   }, []);
@@ -125,6 +143,16 @@ export default function HomePage() {
       window.clearTimeout(timer);
     };
   }, [notice]);
+
+  function schedulePostsReload() {
+    if (realtimeTimer.current) {
+      clearTimeout(realtimeTimer.current);
+    }
+
+    realtimeTimer.current = setTimeout(() => {
+      loadPosts();
+    }, 500);
+  }
 
   async function start() {
     setLoading(true);
@@ -144,7 +172,7 @@ export default function HomePage() {
       loadProfile(id),
       loadPeople(id),
       loadFollowing(id),
-      loadPosts(),
+      loadPosts(id),
     ]);
 
     setLoading(false);
@@ -206,134 +234,143 @@ export default function HomePage() {
     setFollowing(ids);
   }
 
-  async function loadPosts() {
-    const result = await supabase
-      .from("posts")
-      .select(
-        "id, user_id, content, image_url, created_at, updated_at, media_url, media_type, media_path",
-      )
-      .order("created_at", {
-        ascending: false,
-      })
-      .limit(50);
-
-    if (result.error) {
-      console.error(result.error);
-      setNotice(result.error.message);
+  async function loadPosts(currentUserId = userId) {
+    if (loadingPostsRef.current) {
       return;
     }
 
-    const rawPosts = (result.data || []) as Post[];
+    loadingPostsRef.current = true;
 
-    if (rawPosts.length === 0) {
-      setPosts([]);
-      return;
-    }
+    try {
+      const result = await supabase
+        .from("posts")
+        .select(
+          "id, user_id, content, image_url, created_at, updated_at, media_url, media_type, media_path",
+        )
+        .order("created_at", {
+          ascending: false,
+        })
+        .limit(50);
 
-    const ids = Array.from(
-      new Set(
-        rawPosts.map(
-          (post: Post) => post.user_id,
+      if (result.error) {
+        console.error(result.error);
+        setNotice(result.error.message);
+        return;
+      }
+
+      const rawPosts = (result.data || []) as Post[];
+
+      if (rawPosts.length === 0) {
+        setPosts([]);
+        return;
+      }
+
+      const ids = Array.from(
+        new Set(
+          rawPosts.map(
+            (post: Post) => post.user_id,
+          ),
         ),
-      ),
-    );
+      );
 
-    const postIds = rawPosts.map(
-      (post: Post) => post.id,
-    );
+      const postIds = rawPosts.map(
+        (post: Post) => post.id,
+      );
 
-    const profilesResult = await supabase
-      .from("profiles")
-      .select(
-        "id, username, full_name, bio, avatar_url",
-      )
-      .in("id", ids);
+      const [
+        profilesResult,
+        likesResult,
+        commentsResult,
+      ] = await Promise.all([
+        supabase
+          .from("profiles")
+          .select(
+            "id, username, full_name, bio, avatar_url",
+          )
+          .in("id", ids),
 
-    const likesResult = await supabase
-      .from("post_likes")
-      .select("post_id, user_id")
-      .in("post_id", postIds);
+        supabase
+          .from("post_likes")
+          .select("post_id, user_id")
+          .in("post_id", postIds),
 
-    const commentsResult = await supabase
-      .from("post_comments")
-      .select("post_id")
-      .in("post_id", postIds);
+        supabase
+          .from("post_comments")
+          .select("post_id")
+          .in("post_id", postIds),
+      ]);
 
-    const profiles = (profilesResult.data ||
-      []) as Profile[];
+      if (profilesResult.error) {
+        console.error(profilesResult.error);
+      }
 
-    const likes = (likesResult.data || []) as {
-      post_id: string;
-      user_id: string;
-    }[];
+      if (likesResult.error) {
+        console.error(likesResult.error);
+      }
 
-    const commentRows = (commentsResult.data ||
-      []) as {
-      post_id: string;
-    }[];
+      if (commentsResult.error) {
+        console.error(commentsResult.error);
+      }
 
-    const profileMap: Record<
-      string,
-      Profile
-    > = {};
+      const profiles =
+        (profilesResult.data || []) as Profile[];
 
-    profiles.forEach((item: Profile) => {
-      profileMap[item.id] = item;
-    });
+      const likes =
+        (likesResult.data || []) as LikeRow[];
 
-    const likeMap: Record<string, number> = {};
+      const commentRows =
+        (commentsResult.data ||
+          []) as CommentCountRow[];
 
-    likes.forEach(
-      (item: {
-        post_id: string;
-        user_id: string;
-      }) => {
-        if (!likeMap[item.post_id]) {
-          likeMap[item.post_id] = 0;
-        }
+      const profileMap: Record<
+        string,
+        Profile
+      > = {};
 
-        likeMap[item.post_id] += 1;
-      },
-    );
+      for (const item of profiles) {
+        profileMap[item.id] = item;
+      }
 
-    const likedMap: Record<string, boolean> = {};
+      const likeMap: Record<string, number> = {};
+      const likedMap: Record<string, boolean> =
+        {};
 
-    likes.forEach(
-      (item: {
-        post_id: string;
-        user_id: string;
-      }) => {
-        if (item.user_id === userId) {
+      for (const item of likes) {
+        likeMap[item.post_id] =
+          (likeMap[item.post_id] || 0) + 1;
+
+        if (item.user_id === currentUserId) {
           likedMap[item.post_id] = true;
         }
-      },
-    );
+      }
 
-    const commentMap: Record<string, number> = {};
+      const commentMap: Record<
+        string,
+        number
+      > = {};
 
-    commentRows.forEach(
-      (item: { post_id: string }) => {
-        if (!commentMap[item.post_id]) {
-          commentMap[item.post_id] = 0;
-        }
+      for (const item of commentRows) {
+        commentMap[item.post_id] =
+          (commentMap[item.post_id] || 0) + 1;
+      }
 
-        commentMap[item.post_id] += 1;
-      },
-    );
+      const resultPosts: PostView[] =
+        rawPosts.map((post: Post) => ({
+          ...post,
+          profile:
+            profileMap[post.user_id] || null,
+          likeCount:
+            likeMap[post.id] || 0,
+          commentCount:
+            commentMap[post.id] || 0,
+          liked:
+            likedMap[post.id] || false,
+        }));
 
-    const resultPosts: PostView[] = rawPosts.map(
-      (post: Post) => ({
-        ...post,
-        profile:
-          profileMap[post.user_id] || null,
-        likeCount: likeMap[post.id] || 0,
-        commentCount:
-          commentMap[post.id] || 0,
-        liked: likedMap[post.id] || false,
-      }),
-    );
-
-    setPosts(resultPosts);
+      setPosts(resultPosts);
+    } finally {
+      loadingPostsRef.current = false;
+    }
   }
 
   function chooseFile(selected: File | null) {
@@ -351,12 +388,13 @@ export default function HomePage() {
       return;
     }
 
-    if (
-      selected.size >
-      100 * 1024 * 1024
-    ) {
+    if (selected.size > 100 * 1024 * 1024) {
       setNotice("Maximum size is 100 MB.");
       return;
+    }
+
+    if (preview) {
+      URL.revokeObjectURL(preview);
     }
 
     setFile(selected);
@@ -367,6 +405,17 @@ export default function HomePage() {
     } else {
       setPreview("");
     }
+  }
+
+  function clearComposer() {
+    if (preview) {
+      URL.revokeObjectURL(preview);
+    }
+
+    setText("");
+    setFile(null);
+    setPreview("");
+    setComposer(false);
   }
 
   async function publish() {
@@ -387,76 +436,168 @@ export default function HomePage() {
     let mediaType: string | null = null;
     let mediaPath: string | null = null;
 
-    if (file) {
-      const extension =
-        file.name.split(".").pop() ||
-        "file";
+    try {
+      if (file) {
+        const extension =
+          file.name.split(".").pop() ||
+          "file";
 
-      const path =
-        `${userId}/${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2)}.${extension}`;
+        const safeExtension =
+          extension
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, "") ||
+          "file";
 
-      const upload = await supabase.storage
-        .from("posts")
-        .upload(path, file, {
-          cacheControl: "3600",
-          upsert: false,
-        });
+        const randomPart =
+          Math.random()
+            .toString(36)
+            .slice(2, 10);
 
-      if (upload.error) {
-        setNotice(upload.error.message);
-        setPosting(false);
+        const path =
+          `${userId}/${Date.now()}-${randomPart}.${safeExtension}`;
+
+        const upload =
+          await supabase.storage
+            .from("posts")
+            .upload(path, file, {
+              cacheControl: "3600",
+              upsert: false,
+            });
+
+        if (upload.error) {
+          setNotice(upload.error.message);
+          return;
+        }
+
+        const publicUrl =
+          supabase.storage
+            .from("posts")
+            .getPublicUrl(path);
+
+        mediaUrl =
+          publicUrl.data.publicUrl;
+
+        mediaPath = path;
+
+        if (file.type.startsWith("image/")) {
+          mediaType = "image";
+        } else if (
+          file.type.startsWith("video/")
+        ) {
+          mediaType = "video";
+        }
+      }
+
+      const insertResult =
+        await supabase
+          .from("posts")
+          .insert({
+            user_id: userId,
+            content:
+              text.trim() || null,
+            image_url:
+              mediaType === "image"
+                ? mediaUrl
+                : null,
+            media_url: mediaUrl,
+            media_type: mediaType,
+            media_path: mediaPath,
+          })
+          .select(
+            "id, user_id, content, image_url, created_at, updated_at, media_url, media_type, media_path",
+          )
+          .single();
+
+      if (insertResult.error) {
+        if (mediaPath) {
+          await supabase.storage
+            .from("posts")
+            .remove([mediaPath]);
+        }
+
+        setNotice(
+          insertResult.error.message,
+        );
         return;
       }
 
-      const publicUrl = supabase.storage
-        .from("posts")
-        .getPublicUrl(path);
+      const newPost =
+        insertResult.data as Post;
 
-      mediaUrl = publicUrl.data.publicUrl;
-      mediaPath = path;
+      const newPostView: PostView = {
+        ...newPost,
+        profile,
+        likeCount: 0,
+        commentCount: 0,
+        liked: false,
+      };
 
-      if (file.type.startsWith("image/")) {
-        mediaType = "image";
-      }
+      setPosts((current) => [
+        newPostView,
+        ...current,
+      ]);
 
-      if (file.type.startsWith("video/")) {
-        mediaType = "video";
-      }
-    }
+      clearComposer();
 
-    const insertResult = await supabase
-      .from("posts")
-      .insert({
-        user_id: userId,
-        content: text.trim() || null,
-        image_url:
-          mediaType === "image"
-            ? mediaUrl
-            : null,
-        media_url: mediaUrl,
-        media_type: mediaType,
-        media_path: mediaPath,
-      });
+      setNotice("Post published.");
+    } catch (error) {
+      console.error(error);
 
-    if (insertResult.error) {
       setNotice(
-        insertResult.error.message,
+        error instanceof Error
+          ? error.message
+          : "Something went wrong.",
       );
+    } finally {
       setPosting(false);
+    }
+  }
+
+  async function createNotification(
+    recipientId: string,
+    type: string,
+  ) {
+    if (
+      !userId ||
+      !recipientId ||
+      recipientId === userId
+    ) {
       return;
     }
 
-    setText("");
-    setFile(null);
-    setPreview("");
-    setComposer(false);
+    const primary = await supabase
+      .from("notifications")
+      .insert({
+        recipient_id: recipientId,
+        actor_id: userId,
+        type,
+        is_read: false,
+      });
 
-    await loadPosts();
+    if (!primary.error) {
+      return;
+    }
 
-    setNotice("Post published.");
-    setPosting(false);
+    console.warn(
+      "Primary notification insert failed:",
+      primary.error.message,
+    );
+
+    const fallback = await supabase
+      .from("notifications")
+      .insert({
+        recipient_id: recipientId,
+        actorid: userId,
+        type,
+        isread: false,
+      });
+
+    if (fallback.error) {
+      console.warn(
+        "Fallback notification insert failed:",
+        fallback.error.message,
+      );
+    }
   }
 
   async function likePost(post: PostView) {
@@ -464,53 +605,110 @@ export default function HomePage() {
       return;
     }
 
-    if (post.liked) {
-      const result = await supabase
-        .from("post_likes")
-        .delete()
-        .eq("post_id", post.id)
-        .eq("user_id", userId);
+    const previousLiked =
+      post.liked;
 
-      if (result.error) {
-        setNotice(result.error.message);
-        return;
-      }
-    } else {
-      const result = await supabase
-        .from("post_likes")
-        .insert({
-          post_id: post.id,
-          user_id: userId,
-        });
+    const previousCount =
+      post.likeCount;
 
-      if (result.error) {
-        setNotice(result.error.message);
-        return;
+    const nextLiked =
+      !previousLiked;
+
+    const nextCount =
+      nextLiked
+        ? previousCount + 1
+        : Math.max(0, previousCount - 1);
+
+    setPosts((current) =>
+      current.map((item) =>
+        item.id === post.id
+          ? {
+              ...item,
+              liked: nextLiked,
+              likeCount: nextCount,
+            }
+          : item,
+      ),
+    );
+
+    try {
+      if (previousLiked) {
+        const result =
+          await supabase
+            .from("post_likes")
+            .delete()
+            .eq("post_id", post.id)
+            .eq("user_id", userId);
+
+        if (result.error) {
+          throw result.error;
+        }
+      } else {
+        const result =
+          await supabase
+            .from("post_likes")
+            .insert({
+              post_id: post.id,
+              user_id: userId,
+            });
+
+        if (result.error) {
+          throw result.error;
+        }
+
+        await createNotification(
+          post.user_id,
+          "like",
+        );
       }
+    } catch (error) {
+      console.error(error);
+
+      setPosts((current) =>
+        current.map((item) =>
+          item.id === post.id
+            ? {
+                ...item,
+                liked: previousLiked,
+                likeCount:
+                  previousCount,
+              }
+            : item,
+        ),
+      );
+
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "Unable to update like.",
+      );
     }
-
-    await loadPosts();
   }
 
-  async function showComments(postId: string) {
+  async function showComments(
+    postId: string,
+  ) {
     setCommentsOpen(postId);
 
-    const result = await supabase
-      .from("post_comments")
-      .select(
-        "id, post_id, user_id, content, created_at",
-      )
-      .eq("post_id", postId)
-      .order("created_at", {
-        ascending: true,
-      });
+    const result =
+      await supabase
+        .from("post_comments")
+        .select(
+          "id, post_id, user_id, content, created_at",
+        )
+        .eq("post_id", postId)
+        .order("created_at", {
+          ascending: true,
+        })
+        .limit(100);
 
     if (result.error) {
       setNotice(result.error.message);
       return;
     }
 
-    const rows = (result.data || []) as Comment[];
+    const rows =
+      (result.data || []) as Comment[];
 
     if (rows.length === 0) {
       setComments([]);
@@ -520,29 +718,38 @@ export default function HomePage() {
     const ids = Array.from(
       new Set(
         rows.map(
-          (item: Comment) => item.user_id,
+          (item: Comment) =>
+            item.user_id,
         ),
       ),
     );
 
-    const profileResult = await supabase
-      .from("profiles")
-      .select(
-        "id, username, full_name, bio, avatar_url",
-      )
-      .in("id", ids);
+    const profileResult =
+      await supabase
+        .from("profiles")
+        .select(
+          "id, username, full_name, bio, avatar_url",
+        )
+        .in("id", ids);
+
+    if (profileResult.error) {
+      console.error(
+        profileResult.error,
+      );
+    }
 
     const profileRows =
-      (profileResult.data || []) as Profile[];
+      (profileResult.data ||
+        []) as Profile[];
 
     const profileMap: Record<
       string,
       Profile
     > = {};
 
-    profileRows.forEach((item: Profile) => {
+    for (const item of profileRows) {
       profileMap[item.id] = item;
-    });
+    }
 
     const finalComments: Comment[] =
       rows.map((item: Comment) => ({
@@ -555,31 +762,84 @@ export default function HomePage() {
     setComments(finalComments);
   }
 
-  async function sendComment(postId: string) {
-    if (!userId || !commentText.trim()) {
+  async function sendComment(
+    postId: string,
+  ) {
+    if (
+      !userId ||
+      !commentText.trim()
+    ) {
       return;
     }
 
-    const result = await supabase
-      .from("post_comments")
-      .insert({
-        post_id: postId,
-        user_id: userId,
-        content: commentText.trim(),
-      });
+    const value =
+      commentText.trim();
+
+    const targetPost =
+      posts.find(
+        (post) =>
+          post.id === postId,
+      );
+
+    setCommentText("");
+
+    const result =
+      await supabase
+        .from("post_comments")
+        .insert({
+          post_id: postId,
+          user_id: userId,
+          content: value,
+        })
+        .select(
+          "id, post_id, user_id, content, created_at",
+        )
+        .single();
 
     if (result.error) {
+      setCommentText(value);
       setNotice(result.error.message);
       return;
     }
 
-    setCommentText("");
+    const inserted =
+      result.data as Comment;
 
-    await showComments(postId);
-    await loadPosts();
+    const newComment: Comment = {
+      ...inserted,
+      profile,
+    };
+
+    setComments((current) => [
+      ...current,
+      newComment,
+    ]);
+
+    setPosts((current) =>
+      current.map((post) =>
+        post.id === postId
+          ? {
+              ...post,
+              commentCount:
+                post.commentCount + 1,
+            }
+          : post,
+      ),
+    );
+
+    if (targetPost) {
+      await createNotification(
+        targetPost.user_id,
+        "comment",
+      );
+    }
+
+    setNotice("Comment added.");
   }
 
-  async function follow(personId: string) {
+  async function follow(
+    personId: string,
+  ) {
     if (!userId) {
       return;
     }
@@ -587,36 +847,70 @@ export default function HomePage() {
     const exists =
       following.includes(personId);
 
-    if (exists) {
-      const result = await supabase
-        .from("follows")
-        .delete()
-        .eq("follower_id", userId)
-        .eq("following_id", personId);
+    const nextFollowing = exists
+      ? following.filter(
+          (id) => id !== personId,
+        )
+      : [...following, personId];
 
-      if (result.error) {
-        setNotice(result.error.message);
-        return;
-      }
-    } else {
-      const result = await supabase
-        .from("follows")
-        .insert({
-          follower_id: userId,
-          following_id: personId,
-        });
+    setFollowing(nextFollowing);
 
-      if (result.error) {
-        setNotice(result.error.message);
-        return;
+    try {
+      if (exists) {
+        const result =
+          await supabase
+            .from("follows")
+            .delete()
+            .eq(
+              "follower_id",
+              userId,
+            )
+            .eq(
+              "following_id",
+              personId,
+            );
+
+        if (result.error) {
+          throw result.error;
+        }
+      } else {
+        const result =
+          await supabase
+            .from("follows")
+            .insert({
+              follower_id: userId,
+              following_id: personId,
+            });
+
+        if (result.error) {
+          throw result.error;
+        }
+
+        await createNotification(
+          personId,
+          "follow",
+        );
       }
+    } catch (error) {
+      console.error(error);
+
+      setFollowing(following);
+
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "Unable to update follow.",
+      );
     }
-
-    await loadFollowing(userId);
   }
 
-  async function removePost(post: PostView) {
-    if (!userId || post.user_id !== userId) {
+  async function removePost(
+    post: PostView,
+  ) {
+    if (
+      !userId ||
+      post.user_id !== userId
+    ) {
       return;
     }
 
@@ -629,23 +923,47 @@ export default function HomePage() {
     }
 
     if (post.media_path) {
-      await supabase.storage
-        .from("posts")
-        .remove([post.media_path]);
+      const storageResult =
+        await supabase.storage
+          .from("posts")
+          .remove([
+            post.media_path,
+          ]);
+
+      if (storageResult.error) {
+        console.warn(
+          "Media delete failed:",
+          storageResult.error.message,
+        );
+      }
     }
 
-    const result = await supabase
-      .from("posts")
-      .delete()
-      .eq("id", post.id)
-      .eq("user_id", userId);
+    const result =
+      await supabase
+        .from("posts")
+        .delete()
+        .eq("id", post.id)
+        .eq("user_id", userId);
 
     if (result.error) {
       setNotice(result.error.message);
       return;
     }
 
-    await loadPosts();
+    setPosts((current) =>
+      current.filter(
+        (item) =>
+          item.id !== post.id,
+      ),
+    );
+
+    if (
+      commentsOpen === post.id
+    ) {
+      setCommentsOpen("");
+      setComments([]);
+    }
+
     setNotice("Post deleted.");
   }
 
@@ -654,29 +972,32 @@ export default function HomePage() {
     router.push("/login");
   }
 
-  const visiblePeople = people.filter(
-    (person: Profile) => {
-      const value =
-        search.trim().toLowerCase();
+  const visiblePeople =
+    people.filter(
+      (person: Profile) => {
+        const value =
+          search
+            .trim()
+            .toLowerCase();
 
-      if (!value) {
-        return true;
-      }
+        if (!value) {
+          return true;
+        }
 
-      const name =
-        person.full_name?.toLowerCase() ||
-        "";
+        const name =
+          person.full_name?.toLowerCase() ||
+          "";
 
-      const username =
-        person.username?.toLowerCase() ||
-        "";
+        const username =
+          person.username?.toLowerCase() ||
+          "";
 
-      return (
-        name.includes(value) ||
-        username.includes(value)
-      );
-    },
-  );
+        return (
+          name.includes(value) ||
+          username.includes(value)
+        );
+      },
+    );
 
   if (loading) {
     return (
@@ -792,7 +1113,9 @@ export default function HomePage() {
             <input
               value={search}
               onChange={(event) =>
-                setSearch(event.target.value)
+                setSearch(
+                  event.target.value,
+                )
               }
               placeholder="Search people..."
               className="h-10 w-full rounded-full border border-[#e8ddd3] bg-[#f8f5ef] pl-10 pr-4 text-sm outline-none focus:border-[#ef704d]"
@@ -801,9 +1124,12 @@ export default function HomePage() {
 
           <button
             onClick={() =>
-              router.push("/notifications")
+              router.push(
+                "/notifications",
+              )
             }
             className="hidden h-10 w-10 items-center justify-center rounded-full border border-[#e8ddd3] bg-white text-lg md:flex"
+            aria-label="Notifications"
           >
             ♡
           </button>
@@ -813,6 +1139,7 @@ export default function HomePage() {
               router.push("/messages")
             }
             className="hidden h-10 w-10 items-center justify-center rounded-full border border-[#e8ddd3] bg-white text-lg md:flex"
+            aria-label="Messages"
           >
             ✦
           </button>
@@ -821,6 +1148,7 @@ export default function HomePage() {
             onClick={() =>
               router.push("/profile")
             }
+            aria-label="Profile"
           >
             <Avatar
               profile={profile}
@@ -862,7 +1190,9 @@ export default function HomePage() {
               label="Notifications"
               icon="♡"
               onClick={() =>
-                router.push("/notifications")
+                router.push(
+                  "/notifications",
+                )
               }
             />
 
@@ -917,14 +1247,6 @@ export default function HomePage() {
             </button>
           </div>
 
-          {/* HOME ADSENSE AD */}
-          <AdSlot
-            adSlot="YOUR_HOME_AD_SLOT_ID"
-            format="auto"
-            responsive
-            className="mb-5"
-          />
-
           {composer && (
             <div className="mb-5 rounded-3xl border border-[#e8ddd3] bg-[#fffdf9] p-5 shadow-sm">
               <div className="flex gap-3">
@@ -940,6 +1262,7 @@ export default function HomePage() {
                     }
                     placeholder="What would you like to share?"
                     rows={4}
+                    maxLength={5000}
                     className="w-full resize-none rounded-2xl border border-[#e8ddd3] bg-[#f8f5ef] p-4 text-sm outline-none focus:border-[#ef704d]"
                   />
 
@@ -972,9 +1295,9 @@ export default function HomePage() {
                         className="hidden"
                         onChange={(event) =>
                           chooseFile(
-                            event.target.files
-                              ?.item(0) ||
-                              null,
+                            event.target.files?.item(
+                              0,
+                            ) || null,
                           )
                         }
                       />
@@ -982,12 +1305,7 @@ export default function HomePage() {
 
                     <div className="flex gap-2">
                       <button
-                        onClick={() => {
-                          setComposer(false);
-                          setText("");
-                          setFile(null);
-                          setPreview("");
-                        }}
+                        onClick={clearComposer}
                         className="rounded-full px-4 py-2 text-sm font-semibold text-[#766a62]"
                       >
                         Cancel
@@ -1036,278 +1354,278 @@ export default function HomePage() {
           ) : (
             <div className="space-y-5">
               {posts.map(
-                (post: PostView, index: number) => (
-                  <div key={post.id}>
-                    <article className="overflow-hidden rounded-3xl border border-[#e8ddd3] bg-[#fffdf9] shadow-sm">
-                      <div className="flex items-center gap-3 p-5">
+                (post: PostView) => (
+                  <article
+                    key={post.id}
+                    className="overflow-hidden rounded-3xl border border-[#e8ddd3] bg-[#fffdf9] shadow-sm"
+                  >
+                    <div className="flex items-center gap-3 p-5">
+                      <button
+                        onClick={() =>
+                          router.push(
+                            `/profile/${post.user_id}`,
+                          )
+                        }
+                        aria-label="Open profile"
+                      >
+                        <Avatar
+                          profile={
+                            post.profile
+                          }
+                        />
+                      </button>
+
+                      <button
+                        onClick={() =>
+                          router.push(
+                            `/profile/${post.user_id}`,
+                          )
+                        }
+                        className="min-w-0 text-left"
+                      >
+                        <div className="truncate text-sm font-bold">
+                          {post.profile
+                            ?.full_name ||
+                            post.profile
+                              ?.username ||
+                            "Inaivu user"}
+                        </div>
+
+                        <div className="mt-0.5 text-xs text-[#988981]">
+                          {post.profile
+                            ?.username
+                            ? `@${post.profile.username}`
+                            : "Inaivu member"}{" "}
+                          ·{" "}
+                          {timeAgo(
+                            post.created_at,
+                          )}
+                        </div>
+                      </button>
+
+                      {post.user_id ===
+                        userId && (
                         <button
                           onClick={() =>
-                            router.push(
-                              `/profile/${post.user_id}`,
-                            )
+                            removePost(post)
                           }
+                          className="ml-auto rounded-full px-3 py-2 text-xs font-bold text-[#9b6657] hover:bg-[#fff0e9]"
                         >
-                          <Avatar
-                            profile={
-                              post.profile
-                            }
-                          />
+                          Delete
                         </button>
+                      )}
+                    </div>
 
-                        <button
-                          onClick={() =>
-                            router.push(
-                              `/profile/${post.user_id}`,
-                            )
-                          }
-                          className="min-w-0 text-left"
-                        >
-                          <div className="truncate text-sm font-bold">
-                            {post.profile
-                              ?.full_name ||
-                              post.profile
-                                ?.username ||
-                              "Inaivu user"}
-                          </div>
-
-                          <div className="mt-0.5 text-xs text-[#988981]">
-                            {post.profile
-                              ?.username
-                              ? `@${post.profile.username}`
-                              : "Inaivu member"}{" "}
-                            ·{" "}
-                            {timeAgo(
-                              post.created_at,
-                            )}
-                          </div>
-                        </button>
-
-                        {post.user_id ===
-                          userId && (
-                          <button
-                            onClick={() =>
-                              removePost(post)
-                            }
-                            className="ml-auto rounded-full px-3 py-2 text-xs font-bold text-[#9b6657] hover:bg-[#fff0e9]"
-                          >
-                            Delete
-                          </button>
-                        )}
+                    {post.content && (
+                      <div className="px-5 pb-4">
+                        <p className="whitespace-pre-wrap text-[15px] leading-7 text-[#403a36]">
+                          {post.content}
+                        </p>
                       </div>
+                    )}
 
-                      {post.content && (
-                        <div className="px-5 pb-4">
-                          <p className="whitespace-pre-wrap text-[15px] leading-7 text-[#403a36]">
-                            {post.content}
-                          </p>
+                    {post.media_url &&
+                      post.media_type ===
+                        "image" && (
+                        <div className="overflow-hidden bg-[#eee9e3]">
+                          <img
+                            src={
+                              post.media_url
+                            }
+                            alt=""
+                            loading="lazy"
+                            decoding="async"
+                            className="max-h-[650px] w-full object-cover"
+                          />
                         </div>
                       )}
 
-                      {post.media_url &&
-                        post.media_type ===
-                          "image" && (
-                          <div className="overflow-hidden bg-[#eee9e3]">
-                            <img
-                              src={
-                                post.media_url
-                              }
-                              alt=""
-                              className="max-h-[650px] w-full object-cover"
-                            />
-                          </div>
-                        )}
+                    {post.media_url &&
+                      post.media_type ===
+                        "video" && (
+                        <div className="overflow-hidden bg-black">
+                          <video
+                            src={
+                              post.media_url
+                            }
+                            controls
+                            playsInline
+                            preload="metadata"
+                            className="max-h-[650px] w-full"
+                          />
+                        </div>
+                      )}
 
-                      {post.media_url &&
-                        post.media_type ===
-                          "video" && (
-                          <div className="overflow-hidden bg-black">
-                            <video
-                              src={
-                                post.media_url
-                              }
-                              controls
-                              playsInline
-                              className="max-h-[650px] w-full"
-                            />
-                          </div>
-                        )}
+                    <div className="flex items-center justify-between px-5 pt-4 text-xs text-[#8f8077]">
+                      <span>
+                        {post.likeCount}{" "}
+                        {post.likeCount === 1
+                          ? "like"
+                          : "likes"}
+                      </span>
 
-                      <div className="flex items-center justify-between px-5 pt-4 text-xs text-[#8f8077]">
-                        <span>
-                          {post.likeCount}{" "}
-                          {post.likeCount === 1
-                            ? "like"
-                            : "likes"}
-                        </span>
+                      <span>
+                        {post.commentCount}{" "}
+                        {post.commentCount ===
+                        1
+                          ? "comment"
+                          : "comments"}
+                      </span>
+                    </div>
 
-                        <span>
-                          {post.commentCount}{" "}
-                          {post.commentCount ===
-                          1
-                            ? "comment"
-                            : "comments"}
-                        </span>
-                      </div>
+                    <div className="mx-5 my-3 h-px bg-[#eee5dc]" />
 
-                      <div className="mx-5 my-3 h-px bg-[#eee5dc]" />
+                    <div className="grid grid-cols-2 gap-2 px-4 pb-4">
+                      <button
+                        onClick={() =>
+                          likePost(post)
+                        }
+                        className={`rounded-2xl px-3 py-2.5 text-sm font-bold ${
+                          post.liked
+                            ? "bg-[#fff0e9] text-[#d95638]"
+                            : "text-[#665b55] hover:bg-[#f8f5ef]"
+                        }`}
+                      >
+                        {post.liked
+                          ? "♥ Liked"
+                          : "♡ Like"}
+                      </button>
 
-                      <div className="grid grid-cols-2 gap-2 px-4 pb-4">
-                        <button
-                          onClick={() =>
-                            likePost(post)
-                          }
-                          className={`rounded-2xl px-3 py-2.5 text-sm font-bold ${
-                            post.liked
-                              ? "bg-[#fff0e9] text-[#d95638]"
-                              : "text-[#665b55] hover:bg-[#f8f5ef]"
-                          }`}
-                        >
-                          {post.liked
-                            ? "♥ Liked"
-                            : "♡ Like"}
-                        </button>
+                      <button
+                        onClick={() =>
+                          showComments(
+                            post.id,
+                          )
+                        }
+                        className="rounded-2xl px-3 py-2.5 text-sm font-bold text-[#665b55] hover:bg-[#f8f5ef]"
+                      >
+                        💬 Comment
+                      </button>
+                    </div>
 
-                        <button
-                          onClick={() =>
-                            showComments(
-                              post.id,
-                            )
-                          }
-                          className="rounded-2xl px-3 py-2.5 text-sm font-bold text-[#665b55] hover:bg-[#f8f5ef]"
-                        >
-                          💬 Comment
-                        </button>
-                      </div>
+                    {commentsOpen ===
+                      post.id && (
+                      <div className="border-t border-[#e8ddd3] bg-[#faf7f2] p-5">
+                        <div className="mb-4 flex items-center justify-between">
+                          <h3 className="font-black">
+                            Comments
+                          </h3>
 
-                      {commentsOpen ===
-                        post.id && (
-                        <div className="border-t border-[#e8ddd3] bg-[#faf7f2] p-5">
-                          <div className="mb-4 flex items-center justify-between">
-                            <h3 className="font-black">
-                              Comments
-                            </h3>
+                          <button
+                            onClick={() => {
+                              setCommentsOpen(
+                                "",
+                              );
+                              setComments([]);
+                            }}
+                            className="text-sm font-semibold text-[#8c7d74]"
+                          >
+                            Close
+                          </button>
+                        </div>
 
-                            <button
-                              onClick={() => {
-                                setCommentsOpen(
-                                  "",
-                                );
-                                setComments([]);
-                              }}
-                              className="text-sm font-semibold text-[#8c7d74]"
-                            >
-                              Close
-                            </button>
-                          </div>
-
-                          <div className="max-h-72 space-y-3 overflow-y-auto">
-                            {comments.length ===
-                            0 ? (
-                              <p className="py-5 text-center text-sm text-[#998a81]">
-                                No comments yet.
-                              </p>
-                            ) : (
-                              comments.map(
-                                (
-                                  comment: Comment,
-                                ) => (
-                                  <div
-                                    key={
-                                      comment.id
+                        <div className="max-h-72 space-y-3 overflow-y-auto">
+                          {comments.length ===
+                          0 ? (
+                            <p className="py-5 text-center text-sm text-[#998a81]">
+                              No comments yet.
+                            </p>
+                          ) : (
+                            comments.map(
+                              (
+                                comment: Comment,
+                              ) => (
+                                <div
+                                  key={
+                                    comment.id
+                                  }
+                                  className="flex gap-3"
+                                >
+                                  <Avatar
+                                    profile={
+                                      comment.profile
                                     }
-                                    className="flex gap-3"
-                                  >
-                                    <Avatar
-                                      profile={
-                                        comment.profile
-                                      }
-                                      size="small"
-                                    />
+                                    size="small"
+                                  />
 
-                                    <div className="rounded-2xl bg-white px-4 py-3">
-                                      <div className="text-xs font-bold">
-                                        {comment
+                                  <div className="rounded-2xl bg-white px-4 py-3">
+                                    <div className="text-xs font-bold">
+                                      {comment
+                                        .profile
+                                        ?.full_name ||
+                                        comment
                                           .profile
-                                          ?.full_name ||
-                                          comment
-                                            .profile
-                                            ?.username ||
-                                          "User"}
-                                      </div>
+                                          ?.username ||
+                                        "User"}
+                                    </div>
 
-                                      <p className="mt-1 text-sm text-[#4b433e]">
-                                        {
-                                          comment.content
-                                        }
-                                      </p>
+                                    <p className="mt-1 text-sm text-[#4b433e]">
+                                      {
+                                        comment.content
+                                      }
+                                    </p>
 
-                                      <div className="mt-1 text-[10px] text-[#a09188]">
-                                        {timeAgo(
-                                          comment.created_at,
-                                        )}
-                                      </div>
+                                    <div className="mt-1 text-[10px] text-[#a09188]">
+                                      {timeAgo(
+                                        comment.created_at,
+                                      )}
                                     </div>
                                   </div>
-                                ),
+                                </div>
+                              ),
+                            )
+                          )}
+                        </div>
+
+                        <div className="mt-4 flex gap-2">
+                          <input
+                            value={
+                              commentText
+                            }
+                            onChange={(
+                              event,
+                            ) =>
+                              setCommentText(
+                                event.target
+                                  .value,
                               )
-                            )}
-                          </div>
-
-                          <div className="mt-4 flex gap-2">
-                            <input
-                              value={
-                                commentText
-                              }
-                              onChange={(
-                                event,
-                              ) =>
-                                setCommentText(
-                                  event.target
-                                    .value,
-                                )
-                              }
-                              onKeyDown={(
-                                event,
-                              ) => {
-                                if (
-                                  event.key ===
-                                  "Enter"
-                                ) {
-                                  sendComment(
-                                    post.id,
-                                  );
-                                }
-                              }}
-                              placeholder="Write a comment..."
-                              className="min-w-0 flex-1 rounded-full border border-[#e8ddd3] bg-white px-4 py-2.5 text-sm outline-none focus:border-[#ef704d]"
-                            />
-
-                            <button
-                              onClick={() =>
+                            }
+                            onKeyDown={(
+                              event,
+                            ) => {
+                              if (
+                                event.key ===
+                                "Enter" &&
+                                !event.shiftKey
+                              ) {
+                                event.preventDefault();
                                 sendComment(
                                   post.id,
-                                )
+                                );
                               }
-                              className="rounded-full bg-[#ef704d] px-5 py-2.5 text-sm font-bold text-white"
-                            >
-                              Send
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </article>
+                            }}
+                            maxLength={1000}
+                            placeholder="Write a comment..."
+                            className="min-w-0 flex-1 rounded-full border border-[#e8ddd3] bg-white px-4 py-2.5 text-sm outline-none focus:border-[#ef704d]"
+                          />
 
-                    {/* SECOND HOME AD AFTER EVERY 3 POSTS */}
-                    {(index + 1) % 3 === 0 &&
-                      index !== posts.length - 1 && (
-                        <AdSlot
-                          adSlot="YOUR_HOME_AD_SLOT_ID"
-                          format="auto"
-                          responsive
-                          className="my-5"
-                        />
-                      )}
-                  </div>
+                          <button
+                            onClick={() =>
+                              sendComment(
+                                post.id,
+                              )
+                            }
+                            disabled={
+                              !commentText.trim()
+                            }
+                            className="rounded-full bg-[#ef704d] px-5 py-2.5 text-sm font-bold text-white disabled:opacity-50"
+                          >
+                            Send
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </article>
                 ),
               )}
             </div>
@@ -1476,6 +1794,7 @@ export default function HomePage() {
               setComposer(true)
             }
             className="flex h-12 w-12 -translate-y-3 items-center justify-center rounded-2xl bg-[#ef704d] text-2xl text-white shadow-lg"
+            aria-label="Create post"
           >
             +
           </button>
@@ -1484,7 +1803,9 @@ export default function HomePage() {
             label="Alerts"
             icon="♡"
             onClick={() =>
-              router.push("/notifications")
+              router.push(
+                "/notifications",
+              )
             }
           />
 
@@ -1503,14 +1824,15 @@ export default function HomePage() {
 
       {notice && (
         <div className="fixed bottom-24 left-1/2 z-[100] -translate-x-1/2">
-          <div className="flex items-center gap-3 rounded-full bg-[#292522] px-5 py-3 text-sm font-semibold text-white shadow-xl">
+          <div className="flex max-w-[90vw] items-center gap-3 rounded-full bg-[#292522] px-5 py-3 text-sm font-semibold text-white shadow-xl">
             <span>{notice}</span>
 
             <button
               onClick={() =>
                 setNotice("")
               }
-              className="text-white/60 hover:text-white"
+              className="shrink-0 text-white/60 hover:text-white"
+              aria-label="Close notification"
             >
               ×
             </button>
@@ -1549,7 +1871,12 @@ function Avatar({
       {profile?.avatar_url ? (
         <img
           src={profile.avatar_url}
-          alt={profile.full_name || "User"}
+          alt={
+            profile.full_name ||
+            "User"
+          }
+          loading="lazy"
+          decoding="async"
           className="h-full w-full object-cover"
         />
       ) : (
@@ -1619,7 +1946,8 @@ function timeAgo(value: string) {
   const now = new Date();
 
   const seconds = Math.floor(
-    (now.getTime() - date.getTime()) /
+    (now.getTime() -
+      date.getTime()) /
       1000,
   );
 
