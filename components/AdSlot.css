@@ -1,0 +1,27 @@
+.inaivu-ad-wrapper {
+  width: 100%;
+  margin: 18px 0;
+  padding: 10px 0;
+  overflow: hidden;
+}
+
+.inaivu-ad-label {
+  width: 100%;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  color: #9a8d85;
+  margin-bottom: 7px;
+  user-select: none;
+}
+
+.inaivu-ad-wrapper .adsbygoogle {
+  width: 100%;
+  min-height: 90px;
+  display: block;
+}
+
+html.dark .inaivu-ad-label {
+  color: #8f8179;
+}
